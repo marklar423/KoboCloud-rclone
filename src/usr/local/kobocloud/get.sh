@@ -13,8 +13,14 @@ if grep -q '^UNINSTALL$' $UserConfig; then
     exit 0
 fi
 
+RCLONE_OP=""
 if grep -q "^REMOVE_DELETED$" $UserConfig; then
-	echo "$Lib/filesList.log" > "$Lib/filesList.log"
+    echo "Will delete files no longer present on remote"
+    # Remove deleted, do a sync.
+    RCLONE_OP="sync"
+else
+    # Don't remove deleted, do a copy.
+    RCLONE_OP="copy"
 fi
 
 
@@ -46,47 +52,60 @@ then
       echo "NickelDBus not found: installing it!"
       wget "https://github.com/shermp/NickelDBus/releases/download/0.2.0/KoboRoot.tgz" -O - | tar xz -C /
   fi
-  if [ -f "${RCLONE}" ]
+  RCLONEVERSION=1.66.0
+  RCLONESIZE=56885400
+  if [[ -f "${RCLONE}"  &&  $(stat -c %s "${RCLONE}") = "${RCLONESIZE}" ]]
   then
       echo "rclone found"
   else
-      echo "rclone not found: installing it!"
+      echo "rclone not found: installing rclone version ${RCLONEVERSION} (size ${RCLONESIZE})!"
       mkdir -p "${RCLONEDIR}"
       rcloneTemp="${RCLONEDIR}/rclone.tmp.zip"
       rm -f "${rcloneTemp}"
-      wget "https://github.com/rclone/rclone/releases/download/v1.64.0/rclone-v1.64.0-linux-arm-v7.zip" -O "${rcloneTemp}"
-      unzip -p "${rcloneTemp}" rclone-v1.64.0-linux-arm-v7/rclone > ${RCLONE}
+      # get rclone distribution with wget, unzip it, but remove it if it failed
+      wget "https://github.com/rclone/rclone/releases/download/v${RCLONEVERSION}/rclone-v${RCLONEVERSION}-linux-arm-v7.zip" -O "${rcloneTemp}" &&
+      unzip -p "${rcloneTemp}" rclone-v${RCLONEVERSION}-linux-arm-v7/rclone > ${RCLONE} || rm ${RCLONE}
       rm -f "${rcloneTemp}"
   fi
 fi
 
+TRANSFERRED=0
 while read url || [ -n "$url" ]; do
   if echo "$url" | grep -q '^#'; then
     continue
-  elif echo "$url" | grep -q "^REMOVE_DELETED$"; then
-	  echo "Will delete files no longer present on remote"
   elif [ -n "$url" ]; then
     echo "Getting $url"    
-    command=""
-    if grep -q "^REMOVE_DELETED$" $UserConfig; then    
-      # Remove deleted, do a sync.
-      command="sync"
-    else
-      # Don't remove deleted, do a copy.
-      command="copy"
-    fi
     remote=$(echo "$url" | cut -d: -f1)
     dir="$Lib/$remote/"
     mkdir -p "$dir"
-    echo ${RCLONE} ${command} --no-check-certificate -v --config ${RCloneConfig} \"$url\" \"$dir\"
-    ${RCLONE} ${command} --no-check-certificate -v --config ${RCloneConfig} "$url" "$dir"
+    # --modify-window 3s
+    # see https://www.mobileread.com/forums/showpost.php?p=4299209&postcount=11
+    RCLONE_COMMAND="${RCLONE} ${RCLONE_OP} --modify-window 3s --no-check-certificate --error-on-no-transfer -v --config ${RCloneConfig}"
+    echo ${RCLONE_COMMAND} \"$url\" \"$dir\"
+    ${RCLONE_COMMAND} "$url" "$dir"
+    rclone_status=$?
+    # Exit code 9 = success, but no files transferred
+    # because of option --error-on-no-transfer
+    # In case of error, we assume that some files may have been transferred
+    if [ $rclone_status != 9 ]
+    then
+        TRANSFERRED=1
+        if [ $rclone_status != 0 ]
+        then echo "rclone: Error code $rclone_status"
+        fi
+    fi
   fi
 done < $UserConfig
 
 if [ "$TEST" = "" ]
 then
-    # Use NickelDBus for library refresh
-    /usr/bin/qndb -t 3000 -s pfmDoneProcessing -m pfmRescanBooksFull
+    if [ $TRANSFERRED = 1 ]
+    then
+       # Use NickelDBus for library refresh
+       /usr/bin/qndb -t 3000 -s pfmDoneProcessing -m pfmRescanBooksFull
+    else
+        echo "No files transferred"
+    fi
 fi
 
 rm "$Logs/index" >/dev/null 2>&1
